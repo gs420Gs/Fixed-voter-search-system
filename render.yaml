@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: bangladesh-voter-python
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      # FIX: the old config pointed DATABASE_URL at a Render "free" managed
+      # Postgres database. Two problems with that at this project's scale:
+      #   1. Render's free Postgres plan is capped at 1 GB storage.
+      #   2. It expires 30 days after creation (14-day grace period to
+      #      upgrade to paid, then it's deleted) -- not a real "free
+      #      forever" option, just a trial.
+      # SQLite has no such expiry and no artificial size cap (only real
+      # disk space matters), so we default to SQLite instead and drop the
+      # `databases:` block below entirely. See README-DEPLOY.md for how to
+      # attach a paid persistent disk if you need data to survive
+      # redeploys; on the free plan the SQLite file resets on redeploy --
+      # the same real limitation the "free" Postgres option had anyway.
+      - key: DATABASE_URL
+        value: sqlite:////app/data/voter.db
+      - key: UPLOAD_DIR
+        value: /app/data/uploads

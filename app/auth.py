@@ -1,0 +1,137 @@
+import logging
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
+import jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
+from .database import get_db
+from .models import User
+
+logger = logging.getLogger(__name__)
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer = HTTPBearer(auto_error=False)
+
+# SECURITY: this used to default to a publicly-known, guessable password
+# ("admin123456") and a fixed placeholder JWT secret whenever the
+# ADMIN_PASSWORD / JWT_SECRET env vars weren't set -- and since this repo
+# is public on GitHub, those old defaults were visible to anyone. Since
+# this app stores real personal data (names, parents' names, birth dates,
+# addresses, voter IDs), we now refuse to fall back to a hardcoded value.
+# Instead: if the env var is missing, generate a strong random one for
+# this process and print it once so local/dev use still works, but make
+# it very clear a production deployment must set these explicitly.
+def _get_or_generate(env_name: str, generator) -> str:
+    value = os.getenv(env_name, "").strip()
+    if value:
+        return value
+    generated = generator()
+    logger.warning(
+        "%s is not set. Generated a random value for THIS PROCESS ONLY "
+        "(it will change on restart, logging everyone out): %s\n"
+        "Set %s as an environment variable before deploying anywhere "
+        "shared/persistent.",
+        env_name, generated, env_name,
+    )
+    return generated
+
+
+JWT_SECRET = _get_or_generate("JWT_SECRET", lambda: secrets.token_urlsafe(48))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip()
+ADMIN_PASSWORD = _get_or_generate("ADMIN_PASSWORD", lambda: secrets.token_urlsafe(12))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = max(1, int(os.getenv("JWT_EXPIRE_HOURS", "12")))
+
+
+def ensure_admin(db: Session):
+    user = db.query(User).filter(User.username == ADMIN_USERNAME).first()
+    if not user:
+        user = User(
+            username=ADMIN_USERNAME,
+            password=pwd_context.hash(ADMIN_PASSWORD),
+            role="admin",
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def authenticate(db: Session, username: str, password: str):
+    user = db.query(User).filter(
+        User.username == username,
+        User.is_active.is_(True),
+    ).first()
+    if not user:
+        return None
+    try:
+        return user if pwd_context.verify(password, user.password) else None
+    except Exception:
+        return None
+
+
+def make_token(user: User):
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user.id),
+        "username": user.username,
+        "role": user.role,
+        "iat": now,
+        "exp": now + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer),
+    db: Session = Depends(get_db),
+):
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = credentials.credentials.strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        subject = payload.get("sub")
+        if subject is None:
+            raise ValueError("Token subject is missing")
+        user_id = int(subject)
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.query(User).filter(
+        User.id == user_id,
+        User.is_active.is_(True),
+    ).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
+def admin_user(user: User = Depends(current_user)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
